@@ -213,6 +213,11 @@ export const MOCK_STUDENTS: Student[] = [
   { id: "732925000198", name: "Keerthana Reddy", dob: "30/09/2005", age: 20, gender: "Female", course: "Physics", year: "3rd", email: "keerthana.reddy@email.com", phone: "+91-9876543198", city: "Pune", subjects: DEPARTMENT_SUBJECTS["Physics"] },
   { id: "732925000199", name: "Gayathri Patel", dob: "30/11/2004", age: 21, gender: "Female", course: "Biology", year: "3rd", email: "gayathri.patel@email.com", phone: "+91-9876543199", city: "Mumbai", subjects: DEPARTMENT_SUBJECTS["Biology"] },
   { id: "732925000200", name: "Nisha Raman", dob: "09/07/2004", age: 21, gender: "Female", course: "Engineering", year: "4th", email: "nisha.raman@email.com", phone: "+91-9876543200", city: "Delhi", subjects: DEPARTMENT_SUBJECTS["Engineering"] },
+  { id: "732925ECR001", name: "ANU", dob: "12/04/2006", age: 19, gender: "Female", course: "Electronics & Communication", year: "2nd", email: "anu@email.com", phone: "+91-9876543036", city: "Salem", subjects: DEPARTMENT_SUBJECTS["Electronics & Communication"] },
+  { id: "732925ECR002", name: "PRIYA", dob: "13/04/2006", age: 19, gender: "Female", course: "Electronics & Communication", year: "2nd", email: "priya@email.com", phone: "+91-9876543037", city: "Chennai", subjects: DEPARTMENT_SUBJECTS["Electronics & Communication"] },
+  { id: "732925ECR003", name: "SARAVANAN", dob: "08/07/2005", age: 20, gender: "Male", course: "Electronics & Communication", year: "3rd", email: "saravanan@email.com", phone: "+91-9876543038", city: "Coimbatore", subjects: DEPARTMENT_SUBJECTS["Electronics & Communication"] },
+  { id: "732925ECR004", name: "kani", dob: "27/04/2008", age: 17, gender: "Female", course: "Electronics & Communication", year: "1st", email: "kani@email.com", phone: "+91-9876543039", city: "Madurai", subjects: DEPARTMENT_SUBJECTS["Electronics & Communication"] },
+  { id: "732925ECR005", name: "shiva", dob: "12/07/2007", age: 18, gender: "Male", course: "Electronics & Communication", year: "1st", email: "shiva@email.com", phone: "+91-9876543040", city: "Tiruchirappalli", subjects: DEPARTMENT_SUBJECTS["Electronics & Communication"] },
 ];
 
 export const MOCK_TIMETABLE: TimetableEntry[] = [

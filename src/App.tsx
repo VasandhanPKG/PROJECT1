@@ -47,8 +47,11 @@ import {
 } from 'recharts';
 import { format } from 'date-fns';
 import { cn } from './utils';
-import { Role, Student, TimetableEntry, Assignment, Notification } from './types';
+import { Role, Student, TimetableEntry, Assignment, Notification, OperationType, FirestoreErrorInfo } from './types';
 import { MOCK_STUDENTS, MOCK_TIMETABLE, MOCK_ASSIGNMENTS, MOCK_NOTIFICATIONS, DEPARTMENT_SUBJECTS } from './mockData';
+import { auth, db, googleProvider, testFirestoreConnection } from './firebase';
+import { signInWithPopup, onAuthStateChanged, signOut, User as FirebaseUser, signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'firebase/auth';
+import { doc, getDoc, setDoc, onSnapshot, collection, query, where, getDocs, deleteDoc, updateDoc } from 'firebase/firestore';
 
 // --- Components ---
 
@@ -107,97 +110,329 @@ const Input = ({ label, ...props }: { label?: string } & React.InputHTMLAttribut
 
 // --- Main App ---
 
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 export default function App() {
+  const [user, setUser] = useState<FirebaseUser | null>(null);
   const [role, setRole] = useState<Role | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isFirestoreOffline, setIsFirestoreOffline] = useState(false);
   const [activeTab, setActiveTab] = useState('dashboard');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [students, setStudents] = useState<Student[]>([]);
-  const [assignments, setAssignments] = useState<Assignment[]>(MOCK_ASSIGNMENTS);
-  const [notifications, setNotifications] = useState<Notification[]>(MOCK_NOTIFICATIONS);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
 
   const [selectedAssignmentId, setSelectedAssignmentId] = useState<string | null>(null);
   const [editAttempts, setEditAttempts] = useState(0);
 
-  const randomStudent = useMemo(() => {
-    if (students.length === 0) return null;
-    return students[0]; // Use the first student as the "logged in" one for consistency
-  }, [students]);
-
-  const handleAssignmentSubmit = (id: string) => {
-    setAssignments(prev => prev.map(a => 
-      a.id === id ? { ...a, status: 'Submitted' } : a
-    ));
-    // Also add a notification
-    const newNotification: Notification = {
-      id: `N${Date.now()}`,
-      title: 'Assignment Submitted',
-      message: `You have successfully submitted the assignment: ${assignments.find(a => a.id === id)?.title}`,
-      date: new Date().toISOString().split('T')[0],
-      type: 'success'
-    };
-    setNotifications(prev => [newNotification, ...prev]);
-  };
-
-  // Login state
-  const [loginForm, setLoginForm] = useState({ username: '', password: '', role: 'student' as Role });
-
-  useEffect(() => {
-    // Migration: Clear old student data to ensure new format is used
-    localStorage.removeItem('eduhub_students');
-    
-    const savedStudents = localStorage.getItem('eduhub_students_v3');
-    if (savedStudents) {
-      setStudents(JSON.parse(savedStudents));
-    } else {
-      setStudents(MOCK_STUDENTS);
-      localStorage.setItem('eduhub_students_v3', JSON.stringify(MOCK_STUDENTS));
-    }
-  }, []);
-
-  const [loginError, setLoginError] = useState<string | null>(null);
+  const [loginForm, setLoginForm] = useState({ identifier: '', password: '', role: 'student' as Role });
   const [showPassword, setShowPassword] = useState(false);
 
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError(null);
-    
-    const { username, password, role: selectedRole } = loginForm;
+  const [currentUserProfile, setCurrentUserProfile] = useState<Student | null>(null);
+  const [loginError, setLoginError] = useState<string | null>(null);
 
-    // Student login logic
-    if (selectedRole === 'student') {
-      const student = students.find(s => s.id === username && s.dob === password);
-      if (student) {
-        setRole('student');
-        setIsLoggedIn(true);
-        setActiveTab('dashboard');
-      } else {
-        setLoginError('Invalid Student ID or Date of Birth. Please check your credentials.');
+  const randomStudent = useMemo(() => {
+    if (role === 'student' && currentUserProfile) return currentUserProfile;
+    if (students.length === 0) return null;
+    return students[0];
+  }, [students, role, currentUserProfile]);
+
+  useEffect(() => {
+    const checkConnection = async () => {
+      try {
+        await testFirestoreConnection();
+      } catch (error: any) {
+        if (error.message && error.message.includes('the client is offline')) {
+          setIsFirestoreOffline(true);
+        }
       }
-      return;
-    }
-
-    // Other roles login logic (faculty)
-    const roleCredentials: Record<Role, { id: string; dob: string }> = {
-      student: { id: '', dob: '' }, 
-      faculty: { id: '123456789012', dob: '01/01/1980' }
     };
+    checkConnection();
+    const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      if (firebaseUser) {
+        setUser(firebaseUser);
+        try {
+          const userDoc = await getDoc(doc(db, 'users', firebaseUser.uid));
+          if (userDoc.exists()) {
+            const userData = userDoc.data();
+            setRole(userData.role as Role);
+            setIsLoggedIn(true);
+            
+            if (userData.role === 'student') {
+              // Fetch student profile
+              const studentQuery = query(collection(db, 'students'), where('email', '==', firebaseUser.email));
+              const studentSnap = await getDocs(studentQuery);
+              if (!studentSnap.empty) {
+                setCurrentUserProfile(studentSnap.docs[0].data() as Student);
+              }
+            }
+          } else {
+            // New user, need to select role
+            setIsLoggedIn(false);
+          }
+        } catch (error: any) {
+          console.error("Auth State Firestore Error:", error);
+          if (error.message?.includes('insufficient permissions')) {
+            handleFirestoreError(error, OperationType.GET, 'users/' + firebaseUser.uid);
+          }
+        }
+      } else {
+        setUser(null);
+        setRole(null);
+        setIsLoggedIn(false);
+      }
+      setIsLoading(false);
+    });
 
-    const creds = roleCredentials[selectedRole];
-    if (username === creds.id && password === creds.dob) {
-      setRole(selectedRole);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (isLoggedIn) {
+      // Real-time listeners for students
+      const unsubStudents = onSnapshot(collection(db, 'students'), (snap) => {
+        setStudents(snap.docs.map(doc => doc.data() as Student));
+      });
+
+      // Real-time listeners for assignments
+      const unsubAssignments = onSnapshot(collection(db, 'assignments'), (snap) => {
+        if (snap.empty && role === 'faculty') {
+          // Seed initial assignments if empty
+          MOCK_ASSIGNMENTS.forEach(async (a) => {
+            await setDoc(doc(db, 'assignments', a.id), a);
+          });
+        } else {
+          setAssignments(snap.docs.map(doc => doc.data() as Assignment));
+        }
+      });
+
+      // Real-time listeners for notifications
+      const unsubNotifications = onSnapshot(collection(db, 'notifications'), (snap) => {
+        if (snap.empty && role === 'faculty') {
+          // Seed initial notifications if empty
+          MOCK_NOTIFICATIONS.forEach(async (n) => {
+            await setDoc(doc(db, 'notifications', n.id), n);
+          });
+        } else {
+          setNotifications(snap.docs.map(doc => doc.data() as Notification));
+        }
+      });
+
+      return () => {
+        unsubStudents();
+        unsubAssignments();
+        unsubNotifications();
+      };
+    }
+  }, [isLoggedIn]);
+
+  const handleGoogleLogin = async (selectedRole: Role) => {
+    setLoginError(null);
+    try {
+      const result = await signInWithPopup(auth, googleProvider);
+      const firebaseUser = result.user;
+      
+      const userRef = doc(db, 'users', firebaseUser.uid);
+      let userDoc;
+      try {
+        userDoc = await getDoc(userRef);
+      } catch (error: any) {
+        if (error.message?.includes('insufficient permissions')) {
+          handleFirestoreError(error, OperationType.GET, 'users/' + firebaseUser.uid);
+        }
+        throw error;
+      }
+      
+      if (!userDoc.exists()) {
+        // First time login, save role
+        try {
+          await setDoc(userRef, {
+            uid: firebaseUser.uid,
+            email: firebaseUser.email,
+            role: selectedRole,
+            name: firebaseUser.displayName,
+            photoURL: firebaseUser.photoURL
+          });
+        } catch (error: any) {
+          if (error.message?.includes('insufficient permissions')) {
+            handleFirestoreError(error, OperationType.WRITE, 'users/' + firebaseUser.uid);
+          }
+          throw error;
+        }
+        setRole(selectedRole);
+      } else {
+        setRole(userDoc.data().role as Role);
+      }
       setIsLoggedIn(true);
-      setActiveTab('dashboard');
-    } else {
-      setLoginError(`Invalid ${selectedRole} credentials. Please try again.`);
+    } catch (error: any) {
+      // Ignore user-cancelled errors
+      if (
+        error.code === 'auth/popup-closed-by-user' || 
+        error.code === 'auth/cancelled-popup-request' ||
+        error.message?.includes('Pending promise was never set')
+      ) {
+        return;
+      }
+
+      console.error("Login Error:", error);
+      setLoginError(error.message || "Failed to sign in with Google.");
     }
   };
 
-  const handleLogout = () => {
+  const handleEmailLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginError(null);
+    const { identifier, password, role: selectedRole } = loginForm;
+
+    try {
+      let email = identifier;
+      
+      // If student role and identifier doesn't look like an email, try to find student by ID
+      if (selectedRole === 'student' && !identifier.includes('@')) {
+        let studentSnapshot;
+        try {
+          const studentQuery = query(collection(db, 'students'), where('id', '==', identifier));
+          studentSnapshot = await getDocs(studentQuery);
+        } catch (error: any) {
+          if (error.message?.includes('insufficient permissions')) {
+            handleFirestoreError(error, OperationType.GET, 'students');
+          }
+          throw error;
+        }
+        
+        if (!studentSnapshot.empty) {
+          email = studentSnapshot.docs[0].data().email;
+        } else {
+          // Fallback to mock data for lookup if Firestore is empty or student not yet seeded
+          const mockStudent = MOCK_STUDENTS.find(s => s.id === identifier);
+          if (mockStudent) {
+            email = mockStudent.email;
+          } else {
+            throw new Error("Student ID not found. Please use your registered ID.");
+          }
+        }
+      }
+
+      let firebaseUser: FirebaseUser;
+      try {
+        const result = await signInWithEmailAndPassword(auth, email, password);
+        firebaseUser = result.user;
+      } catch (error: any) {
+        if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-credential') {
+          // Try to create user if not found (for demo purposes/initial setup)
+          const result = await createUserWithEmailAndPassword(auth, email, password);
+          firebaseUser = result.user;
+        } else {
+          throw error;
+        }
+      }
+
+      const userRef = doc(db, 'users', firebaseUser.uid);
+      let userDoc;
+      try {
+        userDoc = await getDoc(userRef);
+      } catch (error: any) {
+        if (error.message?.includes('insufficient permissions')) {
+          handleFirestoreError(error, OperationType.GET, 'users/' + firebaseUser.uid);
+        }
+        throw error;
+      }
+      
+      if (!userDoc.exists()) {
+        try {
+          await setDoc(userRef, {
+            uid: firebaseUser.uid,
+            email: firebaseUser.email,
+            role: selectedRole,
+            name: email.split('@')[0],
+            photoURL: null
+          });
+        } catch (error: any) {
+          if (error.message?.includes('insufficient permissions')) {
+            handleFirestoreError(error, OperationType.WRITE, 'users/' + firebaseUser.uid);
+          }
+          throw error;
+        }
+        setRole(selectedRole);
+      } else {
+        setRole(userDoc.data().role as Role);
+      }
+      setIsLoggedIn(true);
+    } catch (error: any) {
+      console.error("Email Login Error:", error);
+      setLoginError(error.message || "Failed to sign in.");
+    }
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
     setIsLoggedIn(false);
     setRole(null);
   };
+
+  const handleAssignmentSubmit = async (id: string) => {
+    try {
+      await updateDoc(doc(db, 'assignments', id), { status: 'Submitted' });
+      
+      // Also add a notification
+      const notifId = `N${Date.now()}`;
+      const assignment = assignments.find(a => a.id === id);
+      await setDoc(doc(db, 'notifications', notifId), {
+        id: notifId,
+        title: 'Assignment Submitted',
+        message: `You have successfully submitted the assignment: ${assignment?.title}`,
+        date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        type: 'success'
+      });
+    } catch (error) {
+      console.error("Error submitting assignment:", error);
+    }
+  };
+
+  // Seed data if empty
+  useEffect(() => {
+    const seedData = async () => {
+      try {
+        const studentsSnap = await getDocs(collection(db, 'students'));
+        if (studentsSnap.empty) {
+          for (const student of MOCK_STUDENTS) {
+            await setDoc(doc(db, 'students', student.id), student);
+          }
+          console.log("Database seeded successfully.");
+        }
+      } catch (error) {
+        // Silently fail if no permissions, the app will still work with mock fallback
+        console.log("Seeding skipped or failed (likely permissions).");
+      }
+    };
+    if (isLoggedIn) {
+      seedData();
+    }
+  }, [isLoggedIn]);
 
   // --- Views ---
 
@@ -358,11 +593,20 @@ export default function App() {
     const [showMorePerformance, setShowMorePerformance] = useState(false);
     const [selectedMonth, setSelectedMonth] = useState<string | null>(null);
 
-    const stats = [
-      { label: 'Attendance', value: '92%', icon: ClipboardCheck, color: 'text-green-600', bg: 'bg-green-50', tab: 'attendance' },
-      { label: 'Assignments', value: '12/15', icon: BookOpen, color: 'text-blue-600', bg: 'bg-blue-50', tab: 'assignments' },
-      { label: 'CGPA', value: '9.2', icon: GraduationCap, color: 'text-purple-600', bg: 'bg-purple-50', tab: 'exams' },
-    ];
+    const stats = useMemo(() => {
+      if (role === 'faculty') {
+        return [
+          { label: 'Total Students', value: students.length.toString(), icon: Users, color: 'text-blue-600', bg: 'bg-blue-50', tab: 'students' },
+          { label: 'Avg Attendance', value: '88%', icon: ClipboardCheck, color: 'text-green-600', bg: 'bg-green-50', tab: 'attendance' },
+          { label: 'Assignments', value: assignments.length.toString(), icon: BookOpen, color: 'text-purple-600', bg: 'bg-purple-50', tab: 'assignments' },
+        ];
+      }
+      return [
+        { label: 'Attendance', value: '92%', icon: ClipboardCheck, color: 'text-green-600', bg: 'bg-green-50', tab: 'attendance' },
+        { label: 'Assignments', value: '12/15', icon: BookOpen, color: 'text-blue-600', bg: 'bg-blue-50', tab: 'assignments' },
+        { label: 'CGPA', value: '9.2', icon: GraduationCap, color: 'text-purple-600', bg: 'bg-purple-50', tab: 'exams' },
+      ];
+    }, [role, students.length, assignments.length]);
 
     const chartData = [
       { name: 'Jan', present: 26, absent: 2, late: 2, performance: 85 },
@@ -389,6 +633,21 @@ export default function App() {
 
     return (
       <div className="space-y-6">
+        {role === 'faculty' && (
+          <Card 
+            className="p-6 bg-gradient-to-r from-slate-800 to-slate-900 text-white border-none"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center text-xl font-bold">
+                {user?.displayName?.charAt(0) || 'F'}
+              </div>
+              <div>
+                <p className="text-sm opacity-80">Faculty Portal,</p>
+                <h2 className="text-2xl font-bold">{user?.displayName || 'Faculty Member'}</h2>
+              </div>
+            </div>
+          </Card>
+        )}
         {role === 'student' && randomStudent && (
           <Card 
             className="p-6 bg-gradient-to-r from-blue-600 to-indigo-600 text-white border-none cursor-pointer hover:shadow-lg transition-all active:scale-[0.99]"
@@ -400,7 +659,8 @@ export default function App() {
               </div>
               <div>
                 <p className="text-sm opacity-80">Welcome back,</p>
-                <h2 className="text-2xl font-bold">{randomStudent.name}</h2>
+                <h2 className="text-2xl font-bold">{randomStudent.id}</h2>
+                <p className="text-xs opacity-70 mt-1">{randomStudent.name}</p>
               </div>
             </div>
           </Card>
@@ -603,8 +863,9 @@ export default function App() {
     const COLORS = ['#22c55e', '#ef4444', '#f59e0b'];
 
     const currentStudent = useMemo(() => {
+      if (role === 'student') return currentUserProfile;
       return students[0]; 
-    }, [students]);
+    }, [students, role, currentUserProfile]);
 
     const studentSubjects = currentStudent?.subjects || DEPARTMENT_SUBJECTS['Computer Science'];
 
@@ -760,6 +1021,38 @@ export default function App() {
   const Assignments = () => {
     const selectedAssignment = assignments.find(a => a.id === selectedAssignmentId);
     const [isSubmitting, setIsSubmitting] = useState(false);
+    const [showCreateModal, setShowCreateModal] = useState(false);
+    const [newAssignment, setNewAssignment] = useState<Partial<Assignment>>({
+      title: '',
+      subject: '',
+      dueDate: '',
+      description: '',
+      status: 'Pending'
+    });
+
+    const handleCreateAssignment = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (newAssignment.title && newAssignment.subject) {
+        const id = `ASGN${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+        try {
+          await setDoc(doc(db, 'assignments', id), {
+            ...newAssignment,
+            id,
+            status: 'Pending'
+          });
+          setShowCreateModal(false);
+          setNewAssignment({
+            title: '',
+            subject: '',
+            dueDate: '',
+            description: '',
+            status: 'Pending'
+          });
+        } catch (error) {
+          console.error("Error creating assignment:", error);
+        }
+      }
+    };
 
     if (selectedAssignment) {
       const handleSubmit = async () => {
@@ -902,9 +1195,15 @@ export default function App() {
       <div className="space-y-6">
         <div className="flex justify-between items-center">
           <h2 className="text-2xl font-bold text-slate-900">Assignments</h2>
-          <Button className="flex items-center space-x-2">
-            <Plus className="w-4 h-4" /> <span>Submit New</span>
-          </Button>
+          {role === 'faculty' ? (
+            <Button onClick={() => setShowCreateModal(true)} className="flex items-center space-x-2">
+              <Plus className="w-4 h-4" /> <span>Create Assignment</span>
+            </Button>
+          ) : (
+            <Button className="flex items-center space-x-2">
+              <Plus className="w-4 h-4" /> <span>Submit New</span>
+            </Button>
+          )}
         </div>
         <div className="grid grid-cols-1 gap-4">
           {assignments.map((a) => (
@@ -947,6 +1246,63 @@ export default function App() {
             </Card>
           ))}
         </div>
+
+        {/* Create Assignment Modal */}
+        <AnimatePresence>
+          {showCreateModal && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="bg-white rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl"
+              >
+                <div className="p-6 border-b border-slate-100 flex justify-between items-center">
+                  <h3 className="text-xl font-bold text-slate-900">Create New Assignment</h3>
+                  <button onClick={() => setShowCreateModal(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                    <X className="w-5 h-5 text-slate-400" />
+                  </button>
+                </div>
+                <form onSubmit={handleCreateAssignment} className="p-6 space-y-4">
+                  <Input 
+                    label="Assignment Title" 
+                    placeholder="e.g. Data Structures Project" 
+                    value={newAssignment.title}
+                    onChange={(e) => setNewAssignment({...newAssignment, title: e.target.value})}
+                    required 
+                  />
+                  <Input 
+                    label="Subject" 
+                    placeholder="e.g. Computer Science" 
+                    value={newAssignment.subject}
+                    onChange={(e) => setNewAssignment({...newAssignment, subject: e.target.value})}
+                    required 
+                  />
+                  <Input 
+                    label="Due Date" 
+                    type="date"
+                    value={newAssignment.dueDate}
+                    onChange={(e) => setNewAssignment({...newAssignment, dueDate: e.target.value})}
+                    required 
+                  />
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-slate-700">Description</label>
+                    <textarea 
+                      className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none h-24 text-sm"
+                      value={newAssignment.description}
+                      onChange={(e) => setNewAssignment({...newAssignment, description: e.target.value})}
+                      placeholder="Enter assignment details"
+                    />
+                  </div>
+                  <div className="flex space-x-3 pt-4">
+                    <Button variant="outline" onClick={() => setShowCreateModal(false)} className="flex-1">Cancel</Button>
+                    <Button type="submit" className="flex-1">Create</Button>
+                  </div>
+                </form>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
       </div>
     );
   };
@@ -954,12 +1310,44 @@ export default function App() {
   const FacultyAttendance = () => {
     const [selectedCourse, setSelectedCourse] = useState('Computer Science');
     const [selectedSubject, setSelectedSubject] = useState(DEPARTMENT_SUBJECTS['Computer Science'][0]);
+    const [attendanceData, setAttendanceData] = useState<Record<string, string>>({});
+    const [isSubmitting, setIsSubmitting] = useState(false);
 
     useEffect(() => {
       if (DEPARTMENT_SUBJECTS[selectedCourse]) {
         setSelectedSubject(DEPARTMENT_SUBJECTS[selectedCourse][0]);
       }
     }, [selectedCourse]);
+
+    const handleStatusChange = (studentId: string, status: string) => {
+      setAttendanceData(prev => ({ ...prev, [studentId]: status }));
+    };
+
+    const handleSubmitAttendance = async () => {
+      setIsSubmitting(true);
+      const date = new Date().toISOString().split('T')[0];
+      try {
+        for (const [studentId, status] of Object.entries(attendanceData)) {
+          const student = students.find(s => s.id === studentId);
+          const recordId = `${studentId}_${date}_${selectedSubject.replace(/\s+/g, '_')}`;
+          await setDoc(doc(db, 'attendance', recordId), {
+            studentId,
+            studentEmail: student?.email || '',
+            date,
+            subject: selectedSubject,
+            status,
+            course: selectedCourse
+          });
+        }
+        alert("Attendance submitted successfully!");
+        setAttendanceData({});
+      } catch (error) {
+        console.error("Error submitting attendance:", error);
+        alert("Failed to submit attendance.");
+      } finally {
+        setIsSubmitting(false);
+      }
+    };
 
     return (
       <div className="space-y-6">
@@ -1003,9 +1391,20 @@ export default function App() {
                     <td className="px-6 py-4 text-sm font-bold text-slate-900">{s.name}</td>
                     <td className="px-6 py-4">
                       <div className="flex justify-center space-x-2">
-                        <button className="px-3 py-1 rounded-lg bg-green-100 text-green-700 text-xs font-bold hover:bg-green-200">Present</button>
-                        <button className="px-3 py-1 rounded-lg bg-red-100 text-red-700 text-xs font-bold hover:bg-red-200">Absent</button>
-                        <button className="px-3 py-1 rounded-lg bg-orange-100 text-orange-700 text-xs font-bold hover:bg-orange-200">Late</button>
+                        {['Present', 'Absent', 'Late'].map(status => (
+                          <button 
+                            key={status}
+                            onClick={() => handleStatusChange(s.id, status)}
+                            className={cn(
+                              "px-3 py-1 rounded-lg text-xs font-bold transition-all",
+                              attendanceData[s.id] === status 
+                                ? status === 'Present' ? "bg-green-600 text-white" : status === 'Absent' ? "bg-red-600 text-white" : "bg-orange-600 text-white"
+                                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                            )}
+                          >
+                            {status}
+                          </button>
+                        ))}
                       </div>
                     </td>
                   </tr>
@@ -1015,7 +1414,13 @@ export default function App() {
           </div>
         </Card>
         <div className="flex justify-end">
-          <Button className="px-8">Submit Attendance for {selectedSubject}</Button>
+          <Button 
+            onClick={handleSubmitAttendance}
+            disabled={isSubmitting || Object.keys(attendanceData).length === 0}
+            className="px-8"
+          >
+            {isSubmitting ? 'Submitting...' : `Submit Attendance for ${selectedSubject}`}
+          </Button>
         </div>
       </div>
     );
@@ -1023,6 +1428,8 @@ export default function App() {
 
   const StudentManagement = () => {
     const [showAddModal, setShowAddModal] = useState(false);
+    const [showEditModal, setShowEditModal] = useState(false);
+    const [editingStudent, setEditingStudent] = useState<Student | null>(null);
     const [newStudent, setNewStudent] = useState<Partial<Student>>({
       id: '',
       name: '',
@@ -1031,15 +1438,36 @@ export default function App() {
       subjects: DEPARTMENT_SUBJECTS['Computer Science']
     });
 
-    const handleCourseChange = (course: string) => {
-      setNewStudent({
-        ...newStudent,
-        course,
-        subjects: DEPARTMENT_SUBJECTS[course] || []
-      });
+    const handleCourseChange = (course: string, isEdit: boolean = false) => {
+      if (isEdit && editingStudent) {
+        setEditingStudent({
+          ...editingStudent,
+          course,
+          subjects: DEPARTMENT_SUBJECTS[course] || []
+        });
+      } else {
+        setNewStudent({
+          ...newStudent,
+          course,
+          subjects: DEPARTMENT_SUBJECTS[course] || []
+        });
+      }
     };
 
-    const handleAddStudent = (e: React.FormEvent) => {
+    const handleEditStudent = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (editingStudent && editingStudent.id) {
+        try {
+          await setDoc(doc(db, 'students', editingStudent.id), editingStudent, { merge: true });
+          setShowEditModal(false);
+          setEditingStudent(null);
+        } catch (error) {
+          console.error("Error updating student:", error);
+        }
+      }
+    };
+
+    const handleAddStudent = async (e: React.FormEvent) => {
       e.preventDefault();
       if (newStudent.id && newStudent.name) {
         // Ensure unique subjects before adding
@@ -1056,24 +1484,28 @@ export default function App() {
           city: 'Unknown'
         } as Student;
         
-        const updatedStudents = [...students, studentToAdd];
-        setStudents(updatedStudents);
-        localStorage.setItem('eduhub_students_v3', JSON.stringify(updatedStudents));
-        setShowAddModal(false);
-        setNewStudent({
-          id: '',
-          name: '',
-          course: 'Computer Science',
-          year: '1st',
-          subjects: DEPARTMENT_SUBJECTS['Computer Science']
-        });
+        try {
+          await setDoc(doc(db, 'students', studentToAdd.id), studentToAdd);
+          setShowAddModal(false);
+          setNewStudent({
+            id: '',
+            name: '',
+            course: 'Computer Science',
+            year: '1st',
+            subjects: DEPARTMENT_SUBJECTS['Computer Science']
+          });
+        } catch (error) {
+          console.error("Error adding student:", error);
+        }
       }
     };
 
-    const deleteStudent = (id: string) => {
-      const updatedStudents = students.filter(s => s.id !== id);
-      setStudents(updatedStudents);
-      localStorage.setItem('eduhub_students_v3', JSON.stringify(updatedStudents));
+    const deleteStudent = async (id: string) => {
+      try {
+        await deleteDoc(doc(db, 'students', id));
+      } catch (error) {
+        console.error("Error deleting student:", error);
+      }
     };
 
     return (
@@ -1117,7 +1549,13 @@ export default function App() {
                     </td>
                     <td className="px-6 py-4">
                       <div className="flex justify-center space-x-2">
-                        <button className="p-2 text-slate-400 hover:text-blue-600 transition-colors">
+                        <button 
+                          onClick={() => {
+                            setEditingStudent(s);
+                            setShowEditModal(true);
+                          }}
+                          className="p-2 text-slate-400 hover:text-blue-600 transition-colors"
+                        >
                           <Edit className="w-4 h-4" />
                         </button>
                         <button 
@@ -1203,12 +1641,196 @@ export default function App() {
             </div>
           )}
         </AnimatePresence>
+        {/* Edit Student Modal */}
+        <AnimatePresence>
+          {showEditModal && editingStudent && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="bg-white rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl"
+              >
+                <div className="p-6 border-b border-slate-100 flex justify-between items-center">
+                  <h3 className="text-xl font-bold text-slate-900">Edit Student</h3>
+                  <button onClick={() => setShowEditModal(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                    <X className="w-5 h-5 text-slate-400" />
+                  </button>
+                </div>
+                <form onSubmit={handleEditStudent} className="p-6 space-y-4">
+                  <Input 
+                    label="Student ID" 
+                    value={editingStudent.id}
+                    disabled
+                    className="bg-slate-50"
+                  />
+                  <Input 
+                    label="Full Name" 
+                    placeholder="e.g. John Doe" 
+                    value={editingStudent.name}
+                    onChange={(e) => setEditingStudent({...editingStudent, name: e.target.value})}
+                    required 
+                  />
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-slate-700">Department</label>
+                    <select 
+                      className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none bg-white"
+                      value={editingStudent.course}
+                      onChange={(e) => handleCourseChange(e.target.value, true)}
+                    >
+                      {Object.keys(DEPARTMENT_SUBJECTS).map(dept => (
+                        <option key={dept} value={dept}>{dept}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-slate-700">Subjects</label>
+                    <textarea 
+                      className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none h-24 text-sm"
+                      value={editingStudent.subjects?.join(', ')}
+                      onChange={(e) => {
+                        const subjects = e.target.value.split(',').map(s => s.trim()).filter(s => s !== '');
+                        setEditingStudent({...editingStudent, subjects});
+                      }}
+                      placeholder="Enter subjects separated by commas"
+                    />
+                  </div>
+                  <div className="flex space-x-3 pt-4">
+                    <Button variant="outline" onClick={() => setShowEditModal(false)} className="flex-1">Cancel</Button>
+                    <Button type="submit" className="flex-1">Save Changes</Button>
+                  </div>
+                </form>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
       </div>
     );
   };
 
-  const ExamResultsView = () => (
-    <div className="space-y-6">
+  const NotificationsView = () => {
+    const [showCreateModal, setShowCreateModal] = useState(false);
+    const [newNotification, setNewNotification] = useState<Partial<Notification>>({
+      title: '',
+      message: '',
+      type: 'info'
+    });
+
+    const handleCreateNotification = async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (newNotification.title && newNotification.message) {
+        const id = `NOTIF${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
+        try {
+          await setDoc(doc(db, 'notifications', id), {
+            ...newNotification,
+            id,
+            date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+          });
+          setShowCreateModal(false);
+          setNewNotification({ title: '', message: '', type: 'info' });
+        } catch (error) {
+          console.error("Error creating notification:", error);
+        }
+      }
+    };
+
+    return (
+      <div className="max-w-3xl mx-auto space-y-4">
+        <div className="flex justify-between items-center mb-6">
+          <h2 className="text-2xl font-bold text-slate-900">Notifications</h2>
+          {role === 'faculty' && (
+            <Button onClick={() => setShowCreateModal(true)} className="flex items-center space-x-2">
+              <Plus className="w-4 h-4" /> <span>Create Notification</span>
+            </Button>
+          )}
+        </div>
+        {notifications.map((n) => (
+          <Card key={n.id} className="p-6">
+            <div className="flex items-start space-x-4">
+              <div className={cn(
+                "p-3 rounded-xl",
+                n.type === 'info' ? 'bg-blue-50 text-blue-600' : 
+                n.type === 'warning' ? 'bg-orange-50 text-orange-600' : 'bg-green-50 text-green-600'
+              )}>
+                <Bell className="w-6 h-6" />
+              </div>
+              <div className="flex-1">
+                <div className="flex justify-between items-start">
+                  <h4 className="text-lg font-bold text-slate-900">{n.title}</h4>
+                  <span className="text-xs text-slate-400">{n.date}</span>
+                </div>
+                <p className="text-slate-600 mt-2">{n.message}</p>
+                <div className="mt-4 flex space-x-2">
+                  <Button variant="outline" className="text-xs">Mark as Read</Button>
+                  <Button variant="secondary" className="text-xs">Delete</Button>
+                </div>
+              </div>
+            </div>
+          </Card>
+        ))}
+
+        {/* Create Notification Modal */}
+        <AnimatePresence>
+          {showCreateModal && (
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="bg-white rounded-3xl w-full max-w-lg overflow-hidden shadow-2xl"
+              >
+                <div className="p-6 border-b border-slate-100 flex justify-between items-center">
+                  <h3 className="text-xl font-bold text-slate-900">Create New Notification</h3>
+                  <button onClick={() => setShowCreateModal(false)} className="p-2 hover:bg-slate-100 rounded-full transition-colors">
+                    <X className="w-5 h-5 text-slate-400" />
+                  </button>
+                </div>
+                <form onSubmit={handleCreateNotification} className="p-6 space-y-4">
+                  <Input 
+                    label="Title" 
+                    placeholder="e.g. Holiday Announcement" 
+                    value={newNotification.title}
+                    onChange={(e) => setNewNotification({...newNotification, title: e.target.value})}
+                    required 
+                  />
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-slate-700">Type</label>
+                    <select 
+                      className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none bg-white"
+                      value={newNotification.type}
+                      onChange={(e) => setNewNotification({...newNotification, type: e.target.value as any})}
+                    >
+                      <option value="info">Information</option>
+                      <option value="warning">Warning</option>
+                      <option value="success">Success</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-sm font-medium text-slate-700">Message</label>
+                    <textarea 
+                      className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-blue-500 outline-none h-24 text-sm"
+                      value={newNotification.message}
+                      onChange={(e) => setNewNotification({...newNotification, message: e.target.value})}
+                      placeholder="Enter notification message"
+                      required
+                    />
+                  </div>
+                  <div className="flex space-x-3 pt-4">
+                    <Button variant="outline" onClick={() => setShowCreateModal(false)} className="flex-1">Cancel</Button>
+                    <Button type="submit" className="flex-1">Create</Button>
+                  </div>
+                </form>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+      </div>
+    );
+  };
+
+  const ExamResultsView = () => {
+    return (
+      <div className="space-y-6">
       <h2 className="text-2xl font-bold text-slate-900">Exams & Results</h2>
       <Card className="p-6">
         <h3 className="text-lg font-bold text-slate-900 mb-6">Upcoming Exam Schedule</h3>
@@ -1270,6 +1892,7 @@ export default function App() {
       </div>
     </div>
   );
+};
 
   const AssessmentQuiz = () => {
     const [step, setStep] = useState(0);
@@ -1437,11 +2060,16 @@ export default function App() {
 
     if (!randomStudent) return null;
 
-    const handleSave = () => {
+    const handleSave = async () => {
       if (editAttempts >= 3) return;
-      setStudents(prev => prev.map(s => s.id === randomStudent.id ? { ...s, ...formData } as Student : s));
-      setEditAttempts(prev => prev + 1);
-      setIsEditing(false);
+      try {
+        const studentRef = doc(db, 'students', randomStudent.id);
+        await setDoc(studentRef, { ...randomStudent, ...formData }, { merge: true });
+        setEditAttempts(prev => prev + 1);
+        setIsEditing(false);
+      } catch (error) {
+        console.error("Error saving profile:", error);
+      }
     };
 
     const details = [
@@ -1540,6 +2168,43 @@ export default function App() {
 
   // --- Layout ---
 
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+      </div>
+    );
+  }
+
+  if (isFirestoreOffline) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
+        <Card className="max-w-md w-full p-8 text-center space-y-6">
+          <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto">
+            <AlertCircle className="w-8 h-8 text-red-600" />
+          </div>
+          <div className="space-y-2">
+            <h2 className="text-2xl font-bold text-slate-900">Connection Error</h2>
+            <p className="text-slate-600">
+              We're unable to connect to the database. This usually happens if Firestore is not enabled in your Firebase project or if the configuration is incorrect.
+            </p>
+          </div>
+          <div className="bg-slate-50 p-4 rounded-lg text-left text-sm space-y-2">
+            <p className="font-bold text-slate-700">Troubleshooting Steps:</p>
+            <ul className="list-disc list-inside text-slate-600 space-y-1">
+              <li>Ensure Firestore is enabled in the Firebase Console.</li>
+              <li>Check if the Project ID <code className="bg-slate-200 px-1 rounded">dhtproj-b3107</code> is correct.</li>
+              <li>Verify that the API Key is not restricted.</li>
+            </ul>
+          </div>
+          <Button onClick={() => window.location.reload()} className="w-full">
+            Retry Connection
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+
   if (!isLoggedIn) {
     return (
       <div className="min-h-screen bg-[#f5f5f5] flex items-center justify-center p-4 font-sans">
@@ -1556,17 +2221,19 @@ export default function App() {
             <p className="text-slate-400 text-sm mt-2 font-medium uppercase tracking-widest">Academic Portal</p>
           </div>
 
-          <Card className="p-8 border-none shadow-xl shadow-slate-200/50 rounded-3xl">
-            <form onSubmit={handleLogin} className="space-y-6">
+          <Card className="p-8 border-none shadow-xl shadow-slate-200/50 rounded-3xl space-y-6">
+            <div className="text-center space-y-2">
+              <h2 className="text-xl font-bold text-slate-900">Welcome</h2>
+              <p className="text-sm text-slate-500">Sign in to access your portal</p>
+            </div>
+
+            <form onSubmit={handleEmailLogin} className="space-y-4">
               <div className="flex p-1 bg-slate-100 rounded-2xl">
                 {(['student', 'faculty'] as Role[]).map((r) => (
                   <button
                     key={r}
                     type="button"
-                    onClick={() => {
-                      setLoginForm({ ...loginForm, role: r });
-                      setLoginError(null);
-                    }}
+                    onClick={() => setLoginForm({ ...loginForm, role: r })}
                     className={cn(
                       "flex-1 py-2 text-[10px] font-bold rounded-xl transition-all capitalize tracking-wider",
                       loginForm.role === r ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
@@ -1577,62 +2244,76 @@ export default function App() {
                 ))}
               </div>
 
-              <div className="space-y-4">
+              <Input 
+                label={loginForm.role === 'student' ? "Student ID" : "Email Address"}
+                type={loginForm.role === 'student' ? "text" : "email"}
+                placeholder={loginForm.role === 'student' ? "e.g. STU001" : "name@example.com"}
+                value={loginForm.identifier}
+                onChange={(e) => setLoginForm({ ...loginForm, identifier: e.target.value })}
+                required
+              />
+              
+              <div className="space-y-2">
                 <Input 
-                  label={loginForm.role === 'student' ? "Student ID" : "Username"}
-                  value={loginForm.username}
-                  onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value.toUpperCase() })}
+                  label="Password" 
+                  type={showPassword ? "text" : "password"} 
+                  placeholder="••••••••"
+                  value={loginForm.password}
+                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
                   required
                 />
-                
-                <div className="space-y-2">
-                  <Input 
-                    label="Password (DOB)" 
-                    type={showPassword ? "text" : "password"} 
-                    value={loginForm.password}
-                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                    required
-                  />
-                  <div className="flex justify-end">
-                    <button 
-                      type="button"
-                      onClick={() => setShowPassword(!showPassword)}
-                      className="text-[10px] font-bold text-blue-600 hover:text-blue-700 uppercase tracking-wider flex items-center space-x-1"
-                    >
-                      {showPassword ? (
-                        <>
-                          <X className="w-3 h-3" />
-                          <span>Hide Password</span>
-                        </>
-                      ) : (
-                        <>
-                          <ChevronRight className="w-3 h-3" />
-                          <span>Show Password</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
+                <div className="flex justify-end">
+                  <button 
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="text-[10px] font-bold text-blue-600 hover:text-blue-700 uppercase tracking-wider flex items-center space-x-1"
+                  >
+                    {showPassword ? <span>Hide</span> : <span>Show</span>} Password
+                  </button>
                 </div>
               </div>
-
-              <AnimatePresence>
-                {loginError && (
-                  <motion.div 
-                    initial={{ opacity: 0, height: 0 }}
-                    animate={{ opacity: 1, height: 'auto' }}
-                    exit={{ opacity: 0, height: 0 }}
-                    className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-start space-x-2"
-                  >
-                    <AlertCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
-                    <p className="text-xs text-red-600 font-medium leading-relaxed">{loginError}</p>
-                  </motion.div>
-                )}
-              </AnimatePresence>
 
               <Button type="submit" className="w-full py-4 rounded-2xl text-sm font-bold tracking-wide shadow-lg shadow-blue-200">
                 Sign In
               </Button>
             </form>
+
+            <div className="relative py-2">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-slate-100"></div>
+              </div>
+              <div className="relative flex justify-center text-[10px] uppercase">
+                <span className="bg-white px-4 text-slate-400 font-bold tracking-widest">or continue with</span>
+              </div>
+            </div>
+
+            <Button 
+              onClick={() => handleGoogleLogin(loginForm.role)}
+              className="w-full py-4 rounded-2xl text-sm font-bold tracking-wide shadow-lg shadow-blue-100 flex items-center justify-center space-x-3 bg-white text-slate-700 border border-slate-200 hover:bg-slate-50"
+            >
+              <img src="https://www.google.com/favicon.ico" className="w-5 h-5" alt="Google" />
+              <span>Sign in with Google</span>
+            </Button>
+
+            <AnimatePresence>
+              {loginError && (
+                <motion.div 
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  className="p-3 bg-red-50 border border-red-100 rounded-xl flex items-start space-x-2"
+                >
+                  <AlertCircle className="w-4 h-4 text-red-500 mt-0.5 shrink-0" />
+                  <p className="text-xs text-red-600 font-medium leading-relaxed">{loginError}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <div className="pt-4 border-t border-slate-100">
+              <p className="text-[10px] text-center text-slate-400 font-medium uppercase tracking-widest">
+                Secure Authentication
+              </p>
+            </div>
           </Card>
           
           <p className="text-center mt-8 text-slate-400 text-xs font-medium">
@@ -1750,35 +2431,7 @@ export default function App() {
               {activeTab === 'exams' && <ExamResultsView />}
               {activeTab === 'assessment' && <AssessmentQuiz />}
               {activeTab === 'fees' && <FeesView />}
-              {activeTab === 'notifications' && (
-                <div className="max-w-3xl mx-auto space-y-4">
-                  <h2 className="text-2xl font-bold text-slate-900 mb-6">Notifications</h2>
-                  {notifications.map((n) => (
-                    <Card key={n.id} className="p-6">
-                      <div className="flex items-start space-x-4">
-                        <div className={cn(
-                          "p-3 rounded-xl",
-                          n.type === 'info' ? 'bg-blue-50 text-blue-600' : 
-                          n.type === 'warning' ? 'bg-orange-50 text-orange-600' : 'bg-green-50 text-green-600'
-                        )}>
-                          <Bell className="w-6 h-6" />
-                        </div>
-                        <div className="flex-1">
-                          <div className="flex justify-between items-start">
-                            <h4 className="text-lg font-bold text-slate-900">{n.title}</h4>
-                            <span className="text-xs text-slate-400">{n.date}</span>
-                          </div>
-                          <p className="text-slate-600 mt-2">{n.message}</p>
-                          <div className="mt-4 flex space-x-2">
-                            <Button variant="outline" className="text-xs">Mark as Read</Button>
-                            <Button variant="secondary" className="text-xs">Delete</Button>
-                          </div>
-                        </div>
-                      </div>
-                    </Card>
-                  ))}
-                </div>
-              )}
+              {activeTab === 'notifications' && <NotificationsView />}
             </motion.div>
           </AnimatePresence>
         </div>
